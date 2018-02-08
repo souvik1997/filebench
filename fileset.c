@@ -498,6 +498,114 @@ fileset_openfile(fb_fdesc_t *fdesc, fileset_t *fileset,
 	return (FILEBENCH_OK);
 }
 
+
+
+/*
+ * First creates the parent directories of the file using
+ * fileset_mkdir(). Then Optionally sets the O_DSYNC flag
+ * and opens the file with open64(). It unlocks the fileset
+ * entry lock, sets the DIRECTIO_ON or DIRECTIO_OFF flags
+ * as requested, and returns the file descriptor integer
+ * for the opened file in the supplied filebench file descriptor.
+ * Returns FILEBENCH_ERROR on error, and FILEBENCH_OK on success.
+ */
+int
+fileset_renamefile(fb_fdesc_t *fdesc, fileset_t *fileset,
+    filesetentry_t *entry, int flag, int filemode, int attrs)
+{
+	char path[MAXPATHLEN];
+	char dir[MAXPATHLEN];
+	char *pathtmp;
+	char path2[MAXPATHLEN];
+	struct stat64 sb;
+	int open_attrs = 0;
+
+	(void) fb_strlcpy(path, avd_get_str(fileset->fs_path), MAXPATHLEN);
+	(void) fb_strlcat(path, "/", MAXPATHLEN);
+	(void) fb_strlcat(path, avd_get_str(fileset->fs_name), MAXPATHLEN);
+	pathtmp = fileset_resolvepath(entry);
+	(void) fb_strlcat(path, pathtmp, MAXPATHLEN);
+	//(void) fb_strlcpy(dir, path, MAXPATHLEN);
+	(void) fb_strlcpy(path2, path, MAXPATHLEN);
+	(void) fb_strlcat(path2, "_rename", MAXPATHLEN);
+	free(pathtmp);
+	//(void) trunc_dirname(dir);
+
+	/* If we are going to create a file, create the parent dirs */
+	/*
+	if ((flag & O_CREAT) && (stat64(dir, &sb) != 0)) {
+		if (fileset_mkdir(dir, 0755) == FILEBENCH_ERROR)
+			return (FILEBENCH_ERROR);
+	}*/
+
+	if (attrs & FLOW_ATTR_DSYNC)
+		open_attrs |= O_SYNC;
+
+#ifdef HAVE_O_DIRECT
+	if (attrs & FLOW_ATTR_DIRECTIO)
+		open_attrs |= O_DIRECT;
+#endif /* HAVE_O_DIRECT */
+
+	if (FB_RENAME(path, path2)
+	    == FILEBENCH_ERROR) {
+		filebench_log(LOG_ERROR,
+		    "Failed to rename file %d, %s, with status %x: %s",
+		    entry->fse_index, path, entry->fse_flags, strerror(errno));
+
+		fileset_unbusy(entry, FALSE, FALSE, 0);
+		return (FILEBENCH_ERROR);
+	}
+
+
+	if (FB_RENAME(path2, path)
+	    == FILEBENCH_ERROR) {
+		filebench_log(LOG_ERROR,
+		    "Failed to rename file %d, %s, with status %x: %s",
+		    entry->fse_index, path, entry->fse_flags, strerror(errno));
+
+		fileset_unbusy(entry, FALSE, FALSE, 0);
+		return (FILEBENCH_ERROR);
+	}
+
+
+#ifdef HAVE_DIRECTIO
+	if (attrs & FLOW_ATTR_DIRECTIO)
+		(void)directio(fdesc->fd_num, DIRECTIO_ON);
+#endif /* HAVE_DIRECTIO */
+
+#ifdef HAVE_NOCACHE_FCNTL
+	if (attrs & FLOW_ATTR_DIRECTIO)
+		(void)fcntl(fdesc->fd_num, F_NOCACHE, 1);
+#endif /* HAVE_NOCACHE_FCNTL */
+
+	/* Disable read ahead with the help of fadvise, if asked for */
+	if (attrs & FLOW_ATTR_FADV_RANDOM) {
+#ifdef HAVE_FADVISE
+		if (posix_fadvise(fdesc->fd_num, 0, 0, POSIX_FADV_RANDOM) 
+			!= FILEBENCH_OK) {
+			filebench_log(LOG_ERROR,
+				"Failed to disable read ahead for file %s, with status %s", 
+			    	path, strerror(errno));
+			fileset_unbusy(entry, FALSE, FALSE, 0);
+			return (FILEBENCH_ERROR);
+		}
+		filebench_log(LOG_INFO, "** Read ahead disabled **");
+#else
+		filebench_log(LOG_INFO, "** Read ahead was NOT disabled: not supported on this platform! **");
+#endif
+	}
+
+
+	if (flag & O_CREAT)
+		fileset_unbusy(entry, TRUE, TRUE, 1);
+	else
+		fileset_unbusy(entry, FALSE, FALSE, 1);
+
+	return (FILEBENCH_OK);
+}
+
+
+
 /*
  * removes all filesetentries from their respective btrees, and puts them
  * on the free list. The supplied argument indicates which free list to

@@ -86,6 +86,9 @@ extern fsplug_func_t *fs_functions_vec;
 #define	FB_OPEN(fd, path, flags, perms) \
 	(*fs_functions_vec->fsp_open)(fd, path, flags, perms)
 
+#define	FB_RENAME(path1, path2) \
+	(*fs_functions_vec->fsp_rename)(path1, path2)
+
 #define	FB_PREAD(fdesc, iobuf, iosize, offset) \
 	(*fs_functions_vec->fsp_pread)(fdesc, iobuf, iosize, offset)
 

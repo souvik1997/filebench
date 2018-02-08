@@ -92,7 +92,9 @@ static int flowoplib_bwlimit(threadflow_t *, flowop_t *flowop);
 static int flowoplib_iopslimit(threadflow_t *, flowop_t *flowop);
 static int flowoplib_opslimit(threadflow_t *, flowop_t *flowop);
 static int flowoplib_openfile(threadflow_t *, flowop_t *flowop);
+static int flowoplib_renamefile(threadflow_t *, flowop_t *flowop);
 static int flowoplib_openfile_common(threadflow_t *, flowop_t *flowop, int fd);
+static int flowoplib_renamefile_common(threadflow_t *, flowop_t *flowop, int fd);
 static int flowoplib_createfile(threadflow_t *, flowop_t *flowop);
 static int flowoplib_closefile(threadflow_t *, flowop_t *flowop);
 static int flowoplib_makedir(threadflow_t *, flowop_t *flowop);
@@ -143,6 +145,8 @@ static flowop_proto_t flowoplib_funcs[] = {
 	flowoplib_finishonbytes, flowop_destruct_generic},
 	{FLOW_TYPE_IO, 0, "openfile", flowop_init_generic,
 	flowoplib_openfile, flowop_destruct_generic},
+	{FLOW_TYPE_IO, 0, "renamefile", flowop_init_generic,
+	flowoplib_renamefile, flowop_destruct_generic},
 	{FLOW_TYPE_IO, 0, "createfile", flowop_init_generic,
 	flowoplib_createfile, flowop_destruct_generic},
 	{FLOW_TYPE_IO, 0, "closefile", flowop_init_generic,
@@ -1449,6 +1453,27 @@ flowoplib_openfile(threadflow_t *threadflow, flowop_t *flowop)
 	return (flowoplib_openfile_common(threadflow, flowop, fd));
 }
 
+
+
+/*
+ * Emulates (and actually does) file open. Obtains a file descriptor
+ * index, then calls flowoplib_openfile_common() to open. Returns
+ * FILEBENCH_ERROR if no file descriptor is found, and returns the
+ * status from flowoplib_openfile_common otherwise (FILEBENCH_ERROR,
+ * FILEBENCH_NORSC, FILEBENCH_OK).
+ */
+static int
+flowoplib_renamefile(threadflow_t *threadflow, flowop_t *flowop)
+{
+	int fd = flowoplib_fdnum(threadflow, flowop);
+
+	if (fd == -1)
+		return (FILEBENCH_ERROR);
+
+	return (flowoplib_renamefile_common(threadflow, flowop, fd));
+}
+
+
 /*
  * Common file opening code for filesets. Uses the supplied
  * file descriptor index to determine the tf_fd entry to use.
@@ -1593,6 +1618,154 @@ flowoplib_openfile_common(threadflow_t *threadflow, flowop_t *flowop, int fd)
 	return (FILEBENCH_OK);
 }
 
+
+
+/*
+ * Common file opening code for filesets. Uses the supplied
+ * file descriptor index to determine the tf_fd entry to use.
+ * If the entry is empty (0) and the fileset exists, fileset
+ * pick is called to select a fileset entry to use. The file
+ * specified in the filesetentry is opened, and the returned
+ * operating system file descriptor and a pointer to the
+ * filesetentry are stored in tf_fd[fd] and tf_fse[fd],
+ * respectively. Returns FILEBENCH_ERROR on error,
+ * FILEBENCH_NORSC if no suitable filesetentry can be found,
+ * and FILEBENCH_OK on success.
+ */
+static int
+flowoplib_renamefile_common(threadflow_t *threadflow, flowop_t *flowop, int fd)
+{
+	filesetentry_t *file;
+	char *fileset_name;
+	int tid = 0;
+	int openflag = 0;
+	int err;
+
+	if (flowop->fo_fileset == NULL) {
+		filebench_log(LOG_ERROR, "flowop NULL file");
+		return (FILEBENCH_ERROR);
+	}
+
+	if ((fileset_name =
+	    avd_get_str(flowop->fo_fileset->fs_name)) == NULL) {
+		filebench_log(LOG_ERROR,
+		    "flowop %s: fileset has no name", flowop->fo_name);
+		return (FILEBENCH_ERROR);
+	}
+
+	/*
+	 * set the open flag for read only or read/write, as appropriate.
+	 */
+	if (avd_get_bool(flowop->fo_fileset->fs_readonly) == TRUE)
+		openflag = O_RDONLY;
+	else if (avd_get_bool(flowop->fo_fileset->fs_writeonly) == TRUE)
+		openflag = O_WRONLY;
+	else
+		openflag = O_RDWR;
+
+	/*
+	 * If the flowop doesn't default to persistent fd
+	 * then get unique thread ID for use by fileset_pick
+	 */
+	if (avd_get_bool(flowop->fo_rotatefd))
+		tid = threadflow->tf_utid;
+
+	if (threadflow->tf_fd[fd].fd_ptr != NULL) {
+		filebench_log(LOG_ERROR,
+		    "flowop %s attempted to open without closing on fd %d",
+		    flowop->fo_name, fd);
+		return (FILEBENCH_ERROR);
+	}
+
+	if (flowop->fo_fileset->fs_attrs & FILESET_IS_RAW_DEV) {
+		int open_attrs = 0;
+		char name[MAXPATHLEN];
+
+		(void) fb_strlcpy(name,
+		    avd_get_str(flowop->fo_fileset->fs_path), MAXPATHLEN);
+		(void) fb_strlcat(name, "/", MAXPATHLEN);
+		(void) fb_strlcat(name, fileset_name, MAXPATHLEN);
+
+		if (avd_get_bool(flowop->fo_dsync))
+			open_attrs |= O_SYNC;
+
+#ifdef HAVE_O_DIRECT
+		if (flowoplib_fileattrs(flowop) & FLOW_ATTR_DIRECTIO)
+			open_attrs |= O_DIRECT;
+#endif /* HAVE_O_DIRECT */
+
+		filebench_log(LOG_DEBUG_SCRIPT,
+		    "open raw device %s flags %d = %d", name, open_attrs, fd);
+
+		if (FB_OPEN(&(threadflow->tf_fd[fd]), name,
+		    openflag | open_attrs, 0666) == FILEBENCH_ERROR) {
+			filebench_log(LOG_ERROR,
+			    "Failed to open raw device %s: %s",
+			    name, strerror(errno));
+			return (FILEBENCH_ERROR);
+		}
+
+#ifdef HAVE_DIRECTIO
+		if (flowoplib_fileattrs(flowop) & FLOW_ATTR_DIRECTIO)
+			(void)directio(threadflow->tf_fd[fd].fd_num, DIRECTIO_ON);
+#endif /* HAVE_DIRECTIO */
+
+#ifdef HAVE_NOCACHE_FCNTL
+		if (flowoplib_fileattrs(flowop) & FLOW_ATTR_DIRECTIO)
+			(void)fcntl(threadflow->tf_fd[fd].fd_num, F_NOCACHE, 1);
+#endif /* HAVE_NOCACHE_FCNTL */
+
+		/* Disable read ahead with the help of fadvise, if asked for */
+		if (flowoplib_fileattrs(flowop) & FLOW_ATTR_FADV_RANDOM) {
+#ifdef HAVE_FADVISE
+			if (posix_fadvise(threadflow->tf_fd[fd].fd_num, 0, 0, POSIX_FADV_RANDOM) 
+				!= FILEBENCH_OK) {
+				filebench_log(LOG_ERROR,
+					"Failed to disable read ahead for raw device %s, with status %s", 
+				    	name, strerror(errno));
+				return (FILEBENCH_ERROR);
+			}
+			filebench_log(LOG_INFO, "** Read ahead disabled ** ");
+#else
+		filebench_log(LOG_INFO, "** Read ahead was NOT disabled: not supported on this platform! **");
+#endif
+		}
+
+		threadflow->tf_fse[fd] = NULL;
+
+		return (FILEBENCH_OK);
+	}
+
+	if ((err = flowoplib_pickfile(&file, flowop,
+	    FILESET_PICKEXISTS, tid)) != FILEBENCH_OK) {
+		filebench_log(LOG_DEBUG_SCRIPT,
+		    "flowop %s failed to pick file from %s on fd %d",
+		    flowop->fo_name, fileset_name, fd);
+		return (err);
+	}
+
+	threadflow->tf_fse[fd] = file;
+
+	flowop_beginop(threadflow, flowop);
+	err = fileset_renamefile(&threadflow->tf_fd[fd], flowop->fo_fileset,
+	    file, openflag, 0666, flowoplib_fileattrs(flowop));
+	flowop_endop(threadflow, flowop, 0);
+
+	if (err == FILEBENCH_ERROR) {
+		filebench_log(LOG_ERROR, "flowop %s failed to open file %s",
+		    flowop->fo_name, file->fse_path);
+		return (FILEBENCH_ERROR);
+	}
+
+	filebench_log(LOG_DEBUG_SCRIPT,
+	    "flowop %s: opened %s fd[%d] = %d",
+	    flowop->fo_name, file->fse_path, fd, threadflow->tf_fd[fd]);
+
+	return (FILEBENCH_OK);
+}
+
+
+
 /*
  * Emulate create of a file. Uses the flowoplib_fdnum to select
  * tf_fd and tf_fse array locations to put the created file's file
@@ -1671,6 +1844,34 @@ flowoplib_createfile(threadflow_t *threadflow, flowop_t *flowop)
 	return (FILEBENCH_OK);
 }
 
+
+/*
+ * Removes the last file or directory name from a pathname.
+ * Basically removes characters from the end of the path by
+ * setting them to \0 until a forward slash '/' is
+ * encountered. It also removes the forward slash.
+ */
+static char *
+trunc_dirname(char *dir)
+{
+        char *s = dir + strlen(dir);
+
+        while (s != dir) {
+                int c = *s;
+
+                *s = 0;
+                //if (c == '/')
+                //        break;
+                s--;
+
+                if (c == '/')
+                        break;
+        }
+        return (dir);
+}
+
+
+
 /*
  * Emulates delete of a file. If a valid fd is provided, it uses the
  * filesetentry stored at that fd location to select the file to be
@@ -1688,6 +1889,8 @@ flowoplib_deletefile(threadflow_t *threadflow, flowop_t *flowop)
 	char path[MAXPATHLEN];
 	char *pathtmp;
 	int fd;
+        char            parentDir[MAXPATHLEN];
+        int             parent_fd;
 
 	fd = flowoplib_fdnum(threadflow, flowop);
 
@@ -1774,9 +1977,25 @@ flowoplib_deletefile(threadflow_t *threadflow, flowop_t *flowop)
 	(void) fb_strlcat(path, pathtmp, MAXPATHLEN);
 	free(pathtmp);
 
+        //(void) fb_strlcpy(parentDir, path, MAXPATHLEN);
+        //(void) trunc_dirname(parentDir);
+
+
 	/* delete the selected file */
 	flowop_beginop(threadflow, flowop);
 	(void) FB_UNLINK(path);
+	
+        /*parent_fd = open(parentDir, O_RDONLY | O_DIRECTORY);
+        if(parent_fd < 0) {
+                printf("%s: error in opening parent\n", __func__);
+                return -1;
+        }
+
+        if(fsync(parent_fd) < 0) {
+                printf("%s: error in syncing parent\n", __func__);
+                return -1;
+        }*/
+
 	flowop_endop(threadflow, flowop, 0);
 
 	/* indicate that it is no longer busy and no longer exists */
@@ -1988,6 +2207,7 @@ flowoplib_makedir(threadflow_t *threadflow, flowop_t *flowop)
 	return (FILEBENCH_OK);
 }
 
+
 /*
  * Use rmdir to delete a directory.  Obtains the fileset name from the
  * flowop, selects an existent leaf directory and obtains its full path,
@@ -2002,6 +2222,8 @@ flowoplib_removedir(threadflow_t *threadflow, flowop_t *flowop)
 	filesetentry_t *dir;
 	int		ret;
 	char		full_path[MAXPATHLEN];
+	char		parentDir[MAXPATHLEN];
+	int		fd;	
 
 	if ((ret = flowoplib_pickleafdir(&dir, flowop,
 	    FILESET_PICKEXISTS)) != FILEBENCH_OK)
@@ -2010,8 +2232,24 @@ flowoplib_removedir(threadflow_t *threadflow, flowop_t *flowop)
 	if ((ret = flowoplib_getdirpath(dir, full_path)) != FILEBENCH_OK)
 		return (ret);
 
+	//(void) fb_strlcpy(parentDir, full_path, MAXPATHLEN);
+	//(void) trunc_dirname(parentDir);
+
 	flowop_beginop(threadflow, flowop);
+
 	(void) FB_RMDIR(full_path);
+	/*
+	fd = open(parentDir, O_RDONLY | O_DIRECTORY);
+	if(fd < 0) {
+		printf("%s: error in opening parent\n", __func__);
+		return -1;
+	}	
+
+	if(fsync(fd) < 0) {
+		printf("%s: error in syncing parent\n", __func__);
+		return -1;
+	}*/
+
 	flowop_endop(threadflow, flowop, 0);
 
 	/* indicate that it is no longer busy and no longer exists */
